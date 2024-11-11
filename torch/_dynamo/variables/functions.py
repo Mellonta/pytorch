@@ -261,33 +261,41 @@ class UserFunctionVariable(BaseUserFunctionVariable):
         for idx, name, cell in zip(
             itertools.count(), self.fn.__code__.co_freevars, closure
         ):
-            var = tx.match_nested_cell(name, cell)
-            if var is not None:
-                # optimization for cleaner codegen
-                result[name] = var
+            # TODO refactor these 3 branches.
+            side_effects = parent.output.side_effects
+            if cell in side_effects:
+                cell_var = side_effects[cell]
+
             elif self.source:
-                side_effects = parent.output.side_effects
-                if cell in side_effects:
-                    cell_var = side_effects[cell]
-                else:
-                    closure_cell = GetItemSource(
-                        AttrSource(self.source, "__closure__"), idx
+                closure_cell = GetItemSource(
+                    AttrSource(self.source, "__closure__"), idx
+                )
+                closure_cell_contents = AttrSource(closure_cell, "cell_contents")
+                try:
+                    contents_var = VariableTracker.build(
+                        parent, cell.cell_contents, closure_cell_contents
                     )
-                    closure_cell_contents = AttrSource(closure_cell, "cell_contents")
-                    try:
-                        contents_var = VariableTracker.build(
-                            parent, cell.cell_contents, closure_cell_contents
-                        )
-                    except ValueError:
-                        # Cell has not yet been assigned
-                        contents_var = variables.DeletedVariable()
-                    cell_var = side_effects.track_cell_existing(
-                        closure_cell, cell, contents_var
-                    )
-                closure_cells[name] = cell_var
+                except ValueError:
+                    # Cell has not yet been assigned
+                    contents_var = variables.DeletedVariable()
+                cell_var = side_effects.track_cell_existing(
+                    closure_cell, cell, contents_var
+                )
 
             else:
-                result[name] = VariableTracker.build(tx, cell.cell_contents)
+                try:
+                    contents_var = VariableTracker.build(parent, cell.cell_contents)
+                except ValueError:
+                    # Cell has not yet been assigned
+                    contents_var = variables.DeletedVariable()
+                cell_var = side_effects.track_cell_existing(None, cell, contents_var)
+                # NOTE: we don't support mutation to this cell because we don't
+                # have a source to materialize the writes.
+                # TODO figure out why we have this branch, and whether we can
+                # remove it.
+                cell_var.mutation_type = None
+
+            closure_cells[name] = cell_var
 
         return result, closure_cells
 
@@ -526,9 +534,6 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
         return self.f_globals
 
     def bind_args(self, parent, args, kwargs):
-        # Avoid circular import
-        from .misc import ClosureVariable, NewCellVariable
-
         code = self.get_code()
         func = types.FunctionType(
             code,
@@ -546,17 +551,9 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
         closure_cells = init_cellvars(parent, result, code)
 
         for idx, name in enumerate(code.co_freevars):
-            cell = self.closure.items[idx]
             assert name not in result
-            # In the regular case, a cell is either a `ClosureVariable` or
-            # `NewCellVariable`.
-            if isinstance(cell, (ClosureVariable, NewCellVariable)):
-                closure_cells[name] = cell
-            else:
-                # We model unmodified cells captured by `UserFunctionVariable` as
-                # their contents, in tracer's `symbolic_locals`. See
-                # `UserFunctionVariable::bind_args`.
-                result[name] = cell
+            cell = self.closure.items[idx]
+            closure_cells[name] = cell
 
         return result, closure_cells
 
